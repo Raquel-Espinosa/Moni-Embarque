@@ -545,6 +545,36 @@ function parseNumber(val) {
   return isNaN(num) ? 0 : num;
 }
 
+/**
+ * Evalúa las reglas de negocio actualizadas para clasificar un Remonte:
+ *  1. Usuario / Documento (Col. L "Nom.Docum.") empieza con "A-"
+ *  2. Tipo Pallet dice "ALTO COSTO" / "ALTOCOSTO" (o contiene ALTOCOSTO, ej. AALTOCOSTO, QALTOCOSTO) o empieza con "AC"
+ *  3. Tipo Pallet dice o contiene "HIELERA" / "HIELERAS"
+ *  4. Tipo Pallet empieza o contiene la palabra "REMONTE" (ej. REMONTE, REMONTECENEFAS, REMONTEPALIACATES)
+ *
+ * Retorna el subtipo de remonte o null si es una tarima física normal.
+ */
+function classifyRemonteRule(nomDocum, tipoPallet) {
+  const doc = String(nomDocum || "").trim().toUpperCase();
+  const tp = String(tipoPallet || "").trim().toUpperCase();
+  const tpCompact = tp.replace(/\s+/g, "");
+
+  if (tpCompact.includes("HIELERA")) {
+    return "Remonte Hieleras";
+  }
+  if (tp.startsWith("REMONTE") || tpCompact.includes("REMONTE")) {
+    return "Remonte";
+  }
+  if (
+    doc.startsWith("A-") ||
+    tpCompact.includes("ALTOCOSTO") ||
+    tp.startsWith("AC")
+  ) {
+    return "Remonte Alto Costo";
+  }
+  return null;
+}
+
 function processLoadedRows(rawRows, sourceType, sourceLabel) {
   state.rawRecords = rawRows;
   state.sourceType = sourceType;
@@ -584,9 +614,8 @@ function processLoadedRows(rawRows, sourceType, sourceLabel) {
       ceFull = ceNom || ceCod || "Sin Tienda";
     }
 
-    // 2. Columna L: Nom.Docum. (Los que empiezan con "A-" son Remontes / Alto Costo)
+    // 2. Columna L: Nom.Docum. / Usuario
     const nomDocum = mapping.nomDocum ? String(row[mapping.nomDocum] || "").trim() : "";
-    const esDocumRemonte = nomDocum.toUpperCase().startsWith("A-");
 
     // 3. Tipo Pallet
     let tipoPallet = mapping.tipoPallet ? String(row[mapping.tipoPallet] || "").trim().toUpperCase() : "";
@@ -606,32 +635,48 @@ function processLoadedRows(rawRows, sourceType, sourceLabel) {
       transporte = "";
     }
 
-    // 5. Cálculo de Tarimas Libres y Remontes (Alto Costo Libre):
-    //    - Si existen las columnas T ("Tarimas Libres") y U ("Alto costo Libre"), las toma directamente.
-    //    - Si NO existen (reporte crudo de SAP), lo calcula automáticamente con la Columna L (Nom.Docum.):
-    //      * Si no tiene Transporte y Nom.Docum. empieza con "A-" -> Remonte / Alto Costo Libre (1)
-    //      * Si no tiene Transporte y Nom.Docum. NO empieza con "A-" (y tiene documento/pallet válido) -> Tarima Libre (1)
+    // 5. Clasificación de Remonte según las 4 reglas indicadas:
+    //    - Usuario (Nom.Docum.) empieza con "A-"
+    //    - Tipo Pallet dice Alto Costo o empieza con "AC"
+    //    - Tipo Pallet dice "Hieleras"
+    //    - Tipo Pallet empieza o tiene la palabra "REMONTE"
+    const subtipoRemonte = classifyRemonteRule(nomDocum, tipoPallet);
+    const esRemonte = subtipoRemonte !== null;
+
+    // Valores de las columnas T y U (si existen en la hoja)
+    const rawColT =
+      mapping.tarimasLibres !== null && row[mapping.tarimasLibres] !== undefined && String(row[mapping.tarimasLibres]).trim() !== ""
+        ? parseNumber(row[mapping.tarimasLibres])
+        : null;
+    const rawColU =
+      mapping.altoCostoLibre !== null && row[mapping.altoCostoLibre] !== undefined && String(row[mapping.altoCostoLibre]).trim() !== ""
+        ? parseNumber(row[mapping.altoCostoLibre])
+        : null;
+
+    // Determinar si la fila está activa/lista en embarques (sin transporte asignado)
+    // Si tiene 1 en Col T o Col U, o si no existen T/U y tiene Tipo Pallet válido sin transporte
+    const esCandidatoLibreSinTransporte =
+      !tieneTransporte &&
+      (rawColT !== null || rawColU !== null
+        ? (rawColT > 0 || rawColU > 0)
+        : (tipoPallet !== "SIN TIPO" || nomDocum !== ""));
+
     let tarimaLibreCount = 0;
-    let altoCostoLibreCount = 0;
+    let altoCostoLibreCount = 0; // Representa el total de Remontes Libres (Alto Costo + Hieleras + Remonte*)
 
-    if (mapping.tarimasLibres !== null && row[mapping.tarimasLibres] !== undefined && String(row[mapping.tarimasLibres]).trim() !== "") {
-      tarimaLibreCount = parseNumber(row[mapping.tarimasLibres]);
-    } else if (!tieneTransporte && nomDocum !== "" && !esDocumRemonte && tipoPallet !== "SIN TIPO") {
-      tarimaLibreCount = 1;
+    if (esCandidatoLibreSinTransporte) {
+      if (esRemonte) {
+        // Cumple regla de Remonte (A-, Alto Costo/AC, Hieleras, o REMONTE) -> NO es tarima libre, es Remonte
+        tarimaLibreCount = 0;
+        altoCostoLibreCount = 1;
+      } else {
+        // No es remonte -> Es Tarima Libre física
+        tarimaLibreCount = rawColT !== null && rawColT > 0 ? rawColT : 1;
+        altoCostoLibreCount = 0;
+      }
     }
 
-    if (mapping.altoCostoLibre !== null && row[mapping.altoCostoLibre] !== undefined && String(row[mapping.altoCostoLibre]).trim() !== "") {
-      altoCostoLibreCount = parseNumber(row[mapping.altoCostoLibre]);
-    } else if (!tieneTransporte && esDocumRemonte) {
-      altoCostoLibreCount = 1;
-    }
-
-    // Determinar si el registro general (incluso con transporte) es un remonte ("A-" en Col. L)
-    const esRemonteAltoCosto =
-      esDocumRemonte ||
-      altoCostoLibreCount > 0 ||
-      tipoPallet === "ALTOCOSTO" ||
-      tipoPallet.startsWith("AC");
+    const esRemonteAltoCosto = esRemonte || altoCostoLibreCount > 0;
 
     // 6. Valor monetario (Columna S)
     const valor = mapping.valor ? parseNumber(row[mapping.valor]) : 0;
@@ -660,6 +705,7 @@ function processLoadedRows(rawRows, sourceType, sourceLabel) {
       ceNombre: ceFull,
       tarimasLibres: tarimaLibreCount,
       altoCostoLibre: altoCostoLibreCount,
+      subtipoRemonte: subtipoRemonte || "",
       esTarimaLibre: tarimaLibreCount > 0,
       esAltoCostoLibre: altoCostoLibreCount > 0,
       esRemonteAltoCosto,
@@ -772,15 +818,18 @@ function renderKPIs() {
     .filter(r => r.tarimasLibres > 0)
     .reduce((acc, r) => acc + r.valor, 0);
 
-  // 2. Suma exacta de Columna U (Alto Costo Libre / Remontes)
+  // 2. Suma de Remontes Libres (A-, Alto Costo/AC*, Hieleras, REMONTE*)
   const totalAltoCostoLibre = records.reduce((acc, r) => acc + r.altoCostoLibre, 0);
+  const remonteACCount = records.filter(r => r.altoCostoLibre > 0 && r.subtipoRemonte === "Remonte Alto Costo").length;
+  const remonteHielerasCount = records.filter(r => r.altoCostoLibre > 0 && r.subtipoRemonte === "Remonte Hieleras").length;
+  const remonteGeneralCount = records.filter(r => r.altoCostoLibre > 0 && r.subtipoRemonte === "Remonte").length;
 
-  // 3. Con Transporte Asignado (diferenciando tarimas físicas vs remontes de alto costo en transporte)
+  // 3. Con Transporte Asignado (diferenciando tarimas físicas vs remontes en transporte)
   const assignedRecords = records.filter(r => r.tieneTransporte);
   const assignedPhysicalPallets = assignedRecords.filter(r => !r.esRemonteAltoCosto).length;
   const assignedAltoCosto = assignedRecords.filter(r => r.esRemonteAltoCosto).length;
 
-  // 4. Tiendas activas y tiendas con Tarimas Libres (Col. T > 0)
+  // 4. Tiendas activas y tiendas con Tarimas Libres
   const uniqueStores = new Set(records.map(r => r.ceNombre));
   const storesWithTarimasLibres = new Set(records.filter(r => r.tarimasLibres > 0).map(r => r.ceNombre));
 
@@ -790,7 +839,7 @@ function renderKPIs() {
     ? (assignedPhysicalPallets / activeTransports.size).toFixed(1)
     : "0";
 
-  // 6. Rezago en Tarimas Libres (únicamente donde Columna T > 0 y antigüedad >= 2 días)
+  // 6. Rezago en Tarimas Libres (únicamente donde Tarimas Libres > 0 y antigüedad >= 2 días)
   const agingTarimasLibres = records
     .filter(r => r.esRezagoTarima)
     .reduce((acc, r) => acc + r.tarimasLibres, 0);
@@ -809,11 +858,12 @@ function renderKPIs() {
     `Valor en piso: $${Math.round(valorTarimasLibres).toLocaleString("es-MX")}`;
 
   document.getElementById("kpi-altocosto-libres").textContent = totalAltoCostoLibre.toLocaleString("es-MX");
-  document.getElementById("kpi-altocosto-sub").textContent = `Remontes Col. U (No son tarimas)`;
+  document.getElementById("kpi-altocosto-sub").textContent =
+    `AC: ${remonteACCount} • Remonte: ${remonteGeneralCount} • Hieleras: ${remonteHielerasCount}`;
 
   document.getElementById("kpi-assigned-pallets").textContent = assignedRecords.length.toLocaleString("es-MX");
   document.getElementById("kpi-assigned-pct").textContent =
-    `${assignedPhysicalPallets.toLocaleString("es-MX")} tarimas + ${assignedAltoCosto.toLocaleString("es-MX")} remontes AC`;
+    `${assignedPhysicalPallets.toLocaleString("es-MX")} tarimas + ${assignedAltoCosto.toLocaleString("es-MX")} remontes`;
 
   document.getElementById("kpi-active-stores").textContent = uniqueStores.size.toLocaleString("es-MX");
   document.getElementById("kpi-stores-sub").textContent =
@@ -1412,7 +1462,7 @@ function renderDetailTable() {
   const sumColT = records.reduce((a, b) => a + b.tarimasLibres, 0);
   const sumColU = records.reduce((a, b) => a + b.altoCostoLibre, 0);
   document.getElementById("table-count-label").textContent =
-    `Mostrando ${records.length.toLocaleString("es-MX")} registros (Suma Col. T Tarimas Libres: ${sumColT.toLocaleString("es-MX")} | Suma Col. U Remontes AC: ${sumColU.toLocaleString("es-MX")})`;
+    `Mostrando ${records.length.toLocaleString("es-MX")} registros (Tarimas Libres: ${sumColT.toLocaleString("es-MX")} | Remontes Libres: ${sumColU.toLocaleString("es-MX")})`;
 
   const tbody = document.getElementById("detail-table-body");
   if (records.length === 0) {
@@ -1425,11 +1475,11 @@ function renderDetailTable() {
     .map(r => {
       let classificationBadge = "";
       if (r.tarimasLibres > 0) {
-        classificationBadge = `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-900 border border-amber-300">🟡 Tarima Libre (Col. T)</span>`;
+        classificationBadge = `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-900 border border-amber-300">🟡 Tarima Libre</span>`;
       } else if (r.altoCostoLibre > 0) {
-        classificationBadge = `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-purple-100 text-purple-800 border border-purple-200">🟣 Remonte Alto Costo (Col. U)</span>`;
+        classificationBadge = `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-purple-100 text-purple-800 border border-purple-200">🟣 ${escapeHtml(r.subtipoRemonte || "Remonte Libre")}</span>`;
       } else if (r.tieneTransporte) {
-        classificationBadge = `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800">🟢 Con Transporte</span>`;
+        classificationBadge = `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800">🟢 Con Transporte${r.esRemonteAltoCosto ? " (Remonte)" : ""}</span>`;
       } else {
         classificationBadge = `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600">${escapeHtml(r.estatusDesc || "Finalizado")}</span>`;
       }
