@@ -201,6 +201,7 @@ async function fetchFromGoogleSheetDirect(sheetId, tabName) {
   ];
 
   // Intento A: Fetch directo a los endpoints CSV públicos de Google Sheets
+  // Usamos nuestro parser CSV nativo (parseCsvToMatrix) para NO alterar las fechas DD.MM.YYYY de SAP
   for (const csvUrl of csvEndpoints) {
     try {
       const res = await fetch(csvUrl, { method: "GET", cache: "no-store" });
@@ -212,9 +213,7 @@ async function fetchFromGoogleSheetDirect(sheetId, tabName) {
           !csvText.includes("show-login-page") &&
           !csvText.includes("accounts.google.com")
         ) {
-          const workbook = XLSX.read(csvText, { type: "string", raw: false });
-          const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-          const matrix = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: "" });
+          const matrix = parseCsvToMatrix(csvText);
           const parsedRecords = convertMatrixToRecords(matrix);
           if (parsedRecords.length > 0) {
             return parsedRecords;
@@ -428,12 +427,32 @@ function parseFlexibleDate(val) {
   const str = String(val).trim();
   if (!str) return null;
 
-  const dmyMatch = str.match(/^(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2,4})/);
-  if (dmyMatch) {
-    const day = parseInt(dmyMatch[1], 10);
-    const month = parseInt(dmyMatch[2], 10) - 1;
-    let year = parseInt(dmyMatch[3], 10);
+  // 1. Si viene con puntos (ej. "03.11.2026" o "29.10.2026" de SAP), SIEMPRE es DD.MM.YYYY
+  const dotMatch = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})/);
+  if (dotMatch) {
+    const day = parseInt(dotMatch[1], 10);
+    const month = parseInt(dotMatch[2], 10) - 1;
+    let year = parseInt(dotMatch[3], 10);
     if (year < 100) year += 2000;
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // 2. Si viene con barras "/" o guiones "-"
+  const slashMatch = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if (slashMatch) {
+    const p1 = parseInt(slashMatch[1], 10);
+    const p2 = parseInt(slashMatch[2], 10);
+    let year = parseInt(slashMatch[3], 10);
+    if (year < 100) year += 2000;
+
+    // Si el segundo número es mayor a 12 (ej. "10/29/2026" convertido por SheetJS), es MM/DD/YYYY
+    let day = p1;
+    let month = p2 - 1;
+    if (p2 > 12 && p1 <= 12) {
+      month = p1 - 1;
+      day = p2;
+    }
     const d = new Date(year, month, day);
     if (!isNaN(d.getTime())) return d;
   }
@@ -447,8 +466,59 @@ function parseFlexibleDate(val) {
     if (!isNaN(d.getTime())) return d;
   }
 
-  const fallback = new Date(str);
-  return isNaN(fallback.getTime()) ? null : fallback;
+  return null;
+}
+
+/**
+ * Parser CSV nativo (RFC 4180) que NO altera los formatos de fecha DD.MM.YYYY de SAP
+ * (a diferencia de SheetJS que interpreta "03.11.2026" como 11 de Marzo en formato EE.UU.)
+ */
+function parseCsvToMatrix(csvText) {
+  const rows = [];
+  let row = [];
+  let cur = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < csvText.length; i++) {
+    const ch = csvText[i];
+    const next = csvText[i + 1];
+
+    if (inQuotes) {
+      if (ch === '"' && next === '"') {
+        cur += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        cur += ch;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+      } else if (ch === ",") {
+        row.push(cur);
+        cur = "";
+      } else if (ch === "\r" && next === "\n") {
+        row.push(cur);
+        rows.push(row);
+        row = [];
+        cur = "";
+        i++;
+      } else if (ch === "\n" || ch === "\r") {
+        row.push(cur);
+        rows.push(row);
+        row = [];
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+  }
+  if (cur !== "" || row.length > 0) {
+    row.push(cur);
+    rows.push(row);
+  }
+  return rows;
 }
 
 function formatDateISO(dateObj) {
@@ -1058,24 +1128,25 @@ function renderDatesChart() {
 
 /**
  * Gráfico 4: Antigüedad exclusivamente de las Tarimas Libres (Columna T)
+ * Desglosado por días exactos desde Fch. Crea. (0 días Hoy, 1 día, 2 días, 3 días, 4+ días)
  */
 function renderAgingChart() {
   const buckets = {
-    "0 a 1 día (Reciente)": 0,
-    "2 a 3 días": 0,
-    "4 a 6 días": 0,
-    "7 a 9 días": 0,
-    "10+ días (Crítico)": 0
+    "0 días (Hoy)": 0,
+    "1 día": 0,
+    "2 días": 0,
+    "3 días": 0,
+    "4+ días (Crítico)": 0
   };
 
   state.filteredRecords
     .filter(r => r.tarimasLibres > 0)
     .forEach(r => {
-      if (r.diasAntiguedad <= 1) buckets["0 a 1 día (Reciente)"] += r.tarimasLibres;
-      else if (r.diasAntiguedad <= 3) buckets["2 a 3 días"] += r.tarimasLibres;
-      else if (r.diasAntiguedad <= 6) buckets["4 a 6 días"] += r.tarimasLibres;
-      else if (r.diasAntiguedad <= 9) buckets["7 a 9 días"] += r.tarimasLibres;
-      else buckets["10+ días (Crítico)"] += r.tarimasLibres;
+      if (r.diasAntiguedad <= 0) buckets["0 días (Hoy)"] += r.tarimasLibres;
+      else if (r.diasAntiguedad === 1) buckets["1 día"] += r.tarimasLibres;
+      else if (r.diasAntiguedad === 2) buckets["2 días"] += r.tarimasLibres;
+      else if (r.diasAntiguedad === 3) buckets["3 días"] += r.tarimasLibres;
+      else buckets["4+ días (Crítico)"] += r.tarimasLibres;
     });
 
   const labels = Object.keys(buckets);
